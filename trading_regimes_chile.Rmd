@@ -1,0 +1,343 @@
+---
+title: "Market Regime Detection in Chilean Equities"
+subtitle: "Hidden Markov Models on the IPSA, mapped to structural-break events"
+author: "MIEL"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 12,
+  fig.height = 8
+)
+
+# ---- Libraries (loaded once) ----
+library(tidyverse)   # dplyr, tidyr, ggplot2, purrr, stringr, forcats, ...
+library(tidyquant)   # Yahoo Finance price download
+library(depmixS4)    # Gaussian Hidden Markov Models
+library(lubridate)   # date handling
+library(scales)      # axis formatting
+library(zoo)         # rolling statistics
+library(slider)      # sliding-window helpers
+
+# depmixS4 (via MASS/nlme) masks several dplyr verbs; pin them back to dplyr
+select    <- dplyr::select
+filter    <- dplyr::filter
+summarise <- dplyr::summarise
+
+set.seed(42)         # reproducible k-means
+
+# Analysis window and output location for the exported figure
+START_DATE  <- as.Date("2018-01-01")
+FIG_DIR     <- "figures"
+if (!dir.exists(FIG_DIR)) dir.create(FIG_DIR, recursive = TRUE)
+```
+
+## 1. IPSA constituents
+
+The universe is the ~28 constituents of the IPSA (Santiago Stock Exchange's
+main index). Yahoo Finance suffixes Chilean tickers with `.SN`.
+
+```{r tickers}
+ipsa_tickers <- tibble::tibble(
+  asset = c(
+    "Aguas Andinas", "Embotelladora Andina", "Banco de Crédito e Inversiones",
+    "Banco Santander Chile", "CAP", "Compañía Cervecerías Unidas",
+    "Cencosud Shopping", "Cencosud", "Banco de Chile", "Empresas CMPC",
+    "Colbún", "Viña Concha y Toro", "Empresas Copec", "Engie Energía Chile",
+    "Enel Américas", "Enel Chile", "Entel Chile", "S.A.C.I. Falabella",
+    "Inversiones Aguas Metropolitanas", "Itaú Corpbanca", "Mallplaza",
+    "Parque Arauco", "Ripley", "Grupo Security", "SMU", "Sonda",
+    "Sociedad Química y Minera de Chile (SQM-B)",
+    "Compañía Sudamericana de Vapores"
+  ),
+  ticker = c(
+    "AGUAS-A.SN", "ANDINA-B.SN", "BCI.SN", "BSANTANDER.SN", "CAP.SN",
+    "CCU.SN", "CENCOSHOPP.SN", "CENCOSUD.SN", "CHILE.SN", "CMPC.SN",
+    "COLBUN.SN", "CONCHATORO.SN", "COPEC.SN", "ECL.SN",
+    "ENELAM.SN", "ENELCHILE.SN", "ENTEL.SN", "FALABELLA.SN",
+    "IAM.SN", "ITAUCORP.SN", "MALLPLAZA.SN", "PARAUCO.SN", "RIPLEY.SN",
+    "SECURITY.SN", "SMU.SN", "SONDA.SN", "SQM-B.SN", "VAPORES.SN"
+  )
+)
+```
+
+## 2. Download prices and compute log returns
+
+For each ticker, pull daily adjusted prices from `START_DATE` to today and
+compute log returns. Series that are too short or missing an `adjusted`
+column are skipped.
+
+```{r download}
+get_asset_returns <- function(ticker, asset) {
+  tryCatch({
+    df <- tq_get(ticker, from = START_DATE)
+
+    if (nrow(df) < 500 || !"adjusted" %in% names(df)) {
+      message(sprintf("Skipping %s (%s): too short or missing 'adjusted'",
+                      asset, ticker))
+      return(NULL)
+    }
+
+    df %>%
+      arrange(date) %>%
+      mutate(
+        log_return = log(adjusted / lag(adjusted)),
+        asset      = asset
+      ) %>%
+      drop_na()
+
+  }, error = function(e) {
+    message(sprintf("Error loading %s (%s): %s", asset, ticker, e$message))
+    NULL
+  })
+}
+
+returns_list <- purrr::map2(ipsa_tickers$ticker, ipsa_tickers$asset,
+                            get_asset_returns)
+prices <- bind_rows(purrr::compact(returns_list))
+```
+
+## 3. Per-asset regimes (Hidden Markov Model)
+
+Fit a 5-state Gaussian HMM to each stock's return series and Viterbi-decode
+its latent state path.
+
+```{r hmm}
+fit_hmm_depmix <- function(ts_data, nstates = 5) {
+  df  <- data.frame(y = ts_data)
+  mod <- depmix(y ~ 1, data = df, nstates = nstates, family = gaussian())
+  fit <- fit(mod, verbose = FALSE)
+  posterior(fit, type = "viterbi")$state
+}
+
+regime_results <- prices %>%
+  group_by(asset) %>%
+  group_modify(~ {
+    ts_data    <- .x$log_return
+    asset_name <- unique(.x$asset)
+
+    # Guard against non-finite or degenerate series
+    if (any(!is.finite(ts_data)) || length(unique(ts_data)) < 10) {
+      message(sprintf("Skipping %s: non-finite or too-short series", asset_name))
+      return(tibble(date = .x$date, asset = asset_name, regime = NA))
+    }
+
+    tryCatch({
+      decoded <- fit_hmm_depmix(ts_data, nstates = 5)
+      tibble(date = .x$date, asset = asset_name, regime = decoded)
+    }, error = function(e) {
+      message(sprintf("Error fitting %s: %s", asset_name, e$message))
+      tibble(date = .x$date, asset = asset_name, regime = NA)
+    })
+  }) %>%
+  ungroup()
+```
+
+## 4. Harmonize regimes across assets (k-means)
+
+Raw HMM states aren't comparable across stocks, so each (asset, state) is
+summarized by its mean return and volatility, then k-means-clustered into
+five interpretable, cross-asset regime types.
+
+```{r cluster}
+regime_stats <- regime_results %>%
+  left_join(prices %>% select(date, asset, log_return),
+            by = c("date", "asset")) %>%
+  filter(!is.na(log_return), !is.na(regime)) %>%
+  group_by(asset, regime) %>%
+  summarise(
+    mean_return = mean(log_return),
+    sd_return   = sd(log_return),
+    n_days      = n(),
+    .groups     = "drop"
+  ) %>%
+  filter(n_days >= 10)   # drop unstable / short-lived states
+
+# Cluster on standardized (mean, volatility)
+clustering_input <- regime_stats %>% mutate(row_id = row_number())
+clustering_data  <- clustering_input %>% select(mean_return, sd_return) %>% scale()
+
+km <- kmeans(clustering_data, centers = 5)
+
+regime_stats <- regime_stats %>%
+  mutate(row_id = row_number()) %>%
+  left_join(
+    clustering_input %>%
+      mutate(regime_type_cluster = km$cluster) %>%
+      select(row_id, regime_type_cluster),
+    by = "row_id"
+  ) %>%
+  select(-row_id)
+
+# Label each cluster by its ACTUAL return/volatility profile. k-means numbers
+# clusters arbitrarily, so a fixed 1:5 -> name mapping is meaningless (it made
+# the whole heatmap collapse to one color). Instead, derive each label from the
+# cluster's day-weighted mean return and volatility, deterministically.
+cluster_profile <- regime_stats %>%
+  group_by(regime_type_cluster) %>%
+  summarise(
+    m = weighted.mean(mean_return, n_days),
+    s = weighted.mean(sd_return,   n_days),
+    .groups = "drop"
+  )
+
+assign_regime_labels <- function(prof) {
+  prof$regime_type <- NA_character_
+  prof$regime_type[which.min(prof$m)] <- "Bearish Shock"    # sharpest drawdown
+  prof$regime_type[which.max(prof$m)] <- "Bullish Strong"   # strongest rally
+  rest <- which(is.na(prof$regime_type))
+  vn <- rest[which.max(prof$s[rest])]                        # choppiest of the rest
+  prof$regime_type[vn] <- "Volatile Neutral"
+  rest <- which(is.na(prof$regime_type))
+  ord <- rest[order(prof$m[rest])]                           # remaining two by mean
+  prof$regime_type[ord[1]] <- "Bearish Stable"
+  prof$regime_type[ord[2]] <- "Bullish Stable"
+  prof
+}
+
+cluster_labels <- assign_regime_labels(cluster_profile) %>%
+  select(regime_type_cluster, regime_type)
+
+regime_stats <- regime_stats %>%
+  left_join(cluster_labels, by = "regime_type_cluster")
+
+regime_labeled <- regime_results %>%
+  left_join(regime_stats %>% select(asset, regime, regime_type),
+            by = c("asset", "regime"))
+```
+
+## 5. Market-wide switch detection
+
+Count how many assets change regime each day and flag co-movement spikes as
+candidate structural-break dates.
+
+```{r switches}
+switch_counts <- regime_results %>%
+  group_by(asset) %>%
+  arrange(date) %>%
+  mutate(switched = regime != lag(regime)) %>%
+  ungroup() %>%
+  filter(switched, !is.na(switched)) %>%
+  count(date, name = "n_switches")
+
+# Local peaks where the daily switch count is both a local max and large
+switch_peaks <- switch_counts %>%
+  arrange(date) %>%
+  mutate(local_max = zoo::rollapply(
+    n_switches, 11,
+    function(x) {
+      center <- ceiling(length(x) / 2)
+      x[center] == max(x) & x[center] >= 8
+    },
+    fill = NA, align = "center"
+  )) %>%
+  filter(local_max)
+
+switch_dates <- switch_peaks$date
+cat("Detected candidate regime-change dates:\n")
+print(as.character(switch_dates))
+```
+
+## 6. Final annotated heatmap
+
+Asset × time regime heatmap. Dashed lines mark the detected structural-break
+dates, annotated with the real political / economic events they coincide with.
+The figure is exported to `figures/regime_heatmap.png`.
+
+```{r final-plot}
+# Structural breaks: the dates the detector flags at >= 8 simultaneous switches,
+# each annotated with the real event it coincides with (alternating label height).
+switch_labels <- tibble::tibble(
+  date = as.Date(c(
+    "2019-10-21", "2019-11-18", "2020-03-12",
+    "2021-05-17", "2021-11-23", "2024-08-05"
+  )),
+  label = c(
+    "Estallido Social",
+    "Acuerdo Constitucional",
+    "COVID-19",
+    "Convención Constituyente",
+    "Presidencial & Parlamentaria",
+    "Yen carry unwind"
+  ),
+  above = c(TRUE, FALSE, TRUE, FALSE, TRUE, FALSE)
+)
+
+# Specification-dependent finding: 2024-10-17 (Banco Central de Chile rate cut)
+# only clears the threshold under a 4-state HMM, not this 5-state one. Shown as a
+# distinct dotted marker to make the finding legible on the figure.
+finding_label <- tibble::tibble(
+  date  = as.Date("2024-10-17"),
+  label = "BCCh rate cut · n=4 only",
+  above = FALSE
+)
+
+# Place annotations just above / below the plotted assets (count varies by run,
+# since some tickers occasionally fail to download from Yahoo)
+n_assets <- dplyr::n_distinct(regime_labeled$asset)
+switch_labels  <- switch_labels  %>% mutate(y = ifelse(above, n_assets + 1.5, -1.5))
+finding_label  <- finding_label  %>% mutate(y = ifelse(above, n_assets + 1.5, -1.5))
+
+regime_plot <- ggplot(regime_labeled,
+                      aes(x = date, y = fct_rev(asset), fill = regime_type)) +
+  geom_tile(height = 0.8) +
+  scale_fill_manual(
+    values = c(
+      "Bullish Stable"   = "#4CAF50",
+      "Volatile Neutral" = "#FF9800",
+      "Bearish Stable"   = "#2196F3",
+      "Bearish Shock"    = "#F44336",
+      "Bullish Strong"   = "#9C27B0"
+    ),
+    na.value = "gray80"
+  ) +
+  geom_vline(data = switch_labels, aes(xintercept = date),
+             color = "black", linetype = "dashed", linewidth = 0.9) +
+  geom_text(
+    data = switch_labels,
+    aes(x = date, y = y, label = label),
+    size = 3, fontface = "bold",
+    vjust = ifelse(switch_labels$above, 0, 1),
+    inherit.aes = FALSE
+  ) +
+  # specification-dependent finding (dotted, grey)
+  geom_vline(data = finding_label, aes(xintercept = date),
+             color = "grey30", linetype = "dotted", linewidth = 0.9) +
+  geom_text(
+    data = finding_label,
+    aes(x = date, y = y, label = label),
+    size = 2.7, fontface = "italic", color = "grey30",
+    vjust = ifelse(finding_label$above, 0, 1),
+    inherit.aes = FALSE
+  ) +
+  labs(
+    title    = "Cluster de cambio de régimen (Hidden Markov Model) de acciones IPSA",
+    subtitle = "Líneas punteadas indican fechas de cambio estructural percibido",
+    x = NULL, y = "Asset", fill = "Tipo de Régimen"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    axis.text.y     = element_text(size = 8),
+    legend.position = "bottom",
+    plot.margin     = margin(30, 10, 60, 10)
+  ) +
+  coord_cartesian(clip = "off")
+
+# Save to disk and also render inline
+ggsave(
+  filename = file.path(FIG_DIR, "regime_heatmap.png"),
+  plot     = regime_plot,
+  width    = 12, height = 8, dpi = 200, bg = "white"
+)
+
+regime_plot
+```

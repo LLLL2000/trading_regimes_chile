@@ -1,0 +1,10 @@
+# Helper script used to render the figure headlessly (canonical source is the .Rmd)
+.run_regimes.R
+
+# R artifacts
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+trading_regimes_chile.html
